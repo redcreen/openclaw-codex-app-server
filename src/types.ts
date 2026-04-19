@@ -275,6 +275,7 @@ export type StoredBinding = {
   sessionKey: string;
   threadId: string;
   workspaceDir: string;
+  followEnabled?: boolean;
   permissionsMode?: PermissionsMode;
   pendingPermissionsMode?: PermissionsMode;
   threadTitle?: string;

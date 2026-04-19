@@ -103,7 +103,7 @@ Pre-release packages are published on matching npm dist-tags instead of `latest`
 
 - Uses your existing local Codex CLI setup instead of a separate hosted bridge.
 - Feels natural in chat: bind once with `/cas_resume`, then just talk.
-- Keeps useful controls close at hand with `/cas_status`, `/cas_plan`, `/cas_review`, and more.
+- Keeps useful controls close at hand with `/cas_status`, `/cas_follow`, `/cas_history`, `/cas_plan`, `/cas_review`, and more.
 - Works well for Telegram and Discord conversations that you want tied to a real Codex thread.
 
 ## Typical Workflow
@@ -137,6 +137,9 @@ Pre-release packages are published on matching npm dist-tags instead of `latest`
 | `/cas_detach` | Unbind this conversation from Codex. | Stops routing plain text from this conversation into the bound thread. |
 | `/cas_stop` | Interrupt the active Codex run. | Only applies when a turn is currently in progress. |
 | `/cas_steer <message>` | Send follow-up steer text to an active run. | Example: `/cas_steer focus on the failing tests first` |
+| `/cas_follow` | Show whether external thread follow is enabled for this conversation. | With no argument, it shows the current state. |
+| `/cas_follow on`, `/cas_follow off` | Enable or disable mirroring of external Codex updates back into the bound conversation. | Useful when you also use VS Code, Codex App, or local `codex resume` on the same thread. |
+| `/cas_history [count]` | Show recent transcript entries from the bound Codex thread. | Reads the local transcript, defaults to 8 entries, caps at 20. |
 | `/cas_plan <goal>` | Ask Codex to plan instead of execute. | The plugin relays plan questions and the final plan back into chat. |
 | `/cas_plan off` | Exit plan mode for this conversation. | Use this when you want to leave planning manually instead of through the normal `Implement this plan` button. |
 | `/cas_review` | Review the current uncommitted changes in the bound workspace. | Requires an existing binding. |
@@ -181,6 +184,7 @@ The status card is the main control surface once a conversation is bound. It sho
 - model selection
 - reasoning selection
 - fast mode toggle when the current model supports it
+- thread follow state
 - permissions toggle between Default and Full Access
 - compaction
 - stopping the active run

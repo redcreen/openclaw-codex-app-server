@@ -4,6 +4,8 @@ export const COMMANDS = [
   ["cas_status", "Show Codex status and controls, or apply model, fast mode, and permissions overrides."],
   ["cas_stop", "Stop the active Codex turn."],
   ["cas_steer", "Send a steer message to the active Codex turn."],
+  ["cas_follow", "Mirror external updates from the bound Codex thread back into this conversation."],
+  ["cas_history", "Show recent transcript entries from the bound Codex thread."],
   ["cas_plan", "Ask Codex to produce a plan, or use 'off' to exit plan mode."],
   ["cas_review", "Run Codex review on the current changes."],
   ["cas_compact", "Compact the current Codex thread."],

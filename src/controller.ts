@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { existsSync, promises as fs } from "node:fs";
 import { createRequire } from "node:module";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
@@ -168,8 +169,26 @@ type ActiveRunRecord = {
   handle: ActiveCodexRun;
 };
 
+type TranscriptEntryKind = "user" | "assistant" | "progress" | "status";
+
+type TranscriptEntry = {
+  kind: TranscriptEntryKind;
+  text: string;
+  timestamp?: string;
+};
+
+type TranscriptMirrorCursor = {
+  threadId: string;
+  sessionPath?: string;
+  offset?: number;
+  carry?: string;
+};
+
 const execFileAsync = promisify(execFile);
 const require = createRequire(import.meta.url);
+const TRANSCRIPT_POLL_INTERVAL_MS = 3_000;
+const DEFAULT_HISTORY_ENTRY_COUNT = 8;
+const MAX_HISTORY_ENTRY_COUNT = 20;
 const TEXT_ATTACHMENT_FILE_EXTENSIONS = new Set([
   ".json",
   ".log",
@@ -914,6 +933,30 @@ function parseFastAction(
   }
   return { error: formatCommandUsage("cas_fast") };
 }
+function parseFollowAction(
+  argsText: string,
+): "on" | "off" | "status" | { error: string } {
+  const normalized = argsText.trim().toLowerCase();
+  if (!normalized || normalized === "status") {
+    return "status";
+  }
+  if (normalized === "on" || normalized === "off") {
+    return normalized;
+  }
+  return { error: formatCommandUsage("cas_follow") };
+}
+
+function parseHistoryCount(argsText: string): number | { error: string } {
+  const normalized = argsText.trim();
+  if (!normalized) {
+    return DEFAULT_HISTORY_ENTRY_COUNT;
+  }
+  const value = Number.parseInt(normalized, 10);
+  if (!Number.isFinite(value) || value < 1 || value > MAX_HISTORY_ENTRY_COUNT) {
+    return { error: formatCommandUsage("cas_history") };
+  }
+  return value;
+}
 function normalizeServiceTier(value: string | undefined | null): string | undefined {
   const normalized = value?.trim().toLowerCase();
   return normalized ? normalized : undefined;
@@ -965,6 +1008,10 @@ function normalizePermissionsMode(value?: string | null): PermissionsMode {
 
 function getBindingPermissionsMode(binding: StoredBinding | null): PermissionsMode {
   return normalizePermissionsMode(binding?.permissionsMode);
+}
+
+function isFollowEnabled(binding: StoredBinding | null): boolean {
+  return binding?.followEnabled !== false;
 }
 
 function getBindingPendingPermissionsMode(binding: StoredBinding | null): PermissionsMode | null {
@@ -1363,7 +1410,11 @@ export class CodexPluginController {
   private readonly client;
   private readonly activeRuns = new Map<string, ActiveRunRecord>();
   private readonly threadChangesCache = new Map<string, Promise<boolean | undefined>>();
+  private readonly transcriptMirrors = new Map<string, TranscriptMirrorCursor>();
+  private readonly transcriptPathCache = new Map<string, string>();
   private readonly store;
+  private followPollTimer?: NodeJS.Timeout;
+  private followPollInFlight = false;
   private serviceWorkspaceDir?: string;
   private lastRuntimeConfig?: unknown;
   private started = false;
@@ -1393,6 +1444,10 @@ export class CodexPluginController {
     }
     await this.store.load();
     await this.client.logStartupProbe().catch(() => undefined);
+    this.followPollTimer = setInterval(() => {
+      void this.pollTranscriptMirrors();
+    }, TRANSCRIPT_POLL_INTERVAL_MS);
+    this.followPollTimer.unref?.();
     this.started = true;
   }
 
@@ -1404,6 +1459,12 @@ export class CodexPluginController {
       await active.handle.interrupt().catch(() => undefined);
     }
     this.activeRuns.clear();
+    if (this.followPollTimer) {
+      clearInterval(this.followPollTimer);
+      this.followPollTimer = undefined;
+    }
+    this.transcriptMirrors.clear();
+    this.transcriptPathCache.clear();
     await this.client.close().catch(() => undefined);
     this.started = false;
   }
@@ -1927,6 +1988,10 @@ export class CodexPluginController {
         return await this.handleStopCommand(conversation);
       case "cas_steer":
         return await this.handleSteerCommand(conversation, args);
+      case "cas_follow":
+        return await this.handleFollowCommand(conversation, binding, args);
+      case "cas_history":
+        return await this.handleHistoryCommand(conversation, binding, args);
       case "cas_plan":
         return await this.handlePlanCommand(conversation, binding, args);
       case "cas_review":
@@ -3237,6 +3302,82 @@ export class CodexPluginController {
     };
   }
 
+  private async handleFollowCommand(
+    conversation: ConversationTarget | null,
+    binding: StoredBinding | null,
+    args: string,
+  ): Promise<ReplyPayload> {
+    if (!conversation || !binding) {
+      return { text: "Bind this conversation to a Codex thread before changing thread follow mode." };
+    }
+    const action = parseFollowAction(args);
+    if (typeof action === "object") {
+      return { text: action.error };
+    }
+    if (action === "status") {
+      return {
+        text: `Thread follow is ${isFollowEnabled(binding) ? "on" : "off"}.`,
+      };
+    }
+    const followEnabled = action === "on";
+    const updatedBinding: StoredBinding = {
+      ...binding,
+      followEnabled,
+      updatedAt: Date.now(),
+    };
+    await this.store.upsertBinding(updatedBinding);
+    if (followEnabled) {
+      await this.fastForwardTranscriptCursor(updatedBinding).catch(() => undefined);
+    } else {
+      this.transcriptMirrors.delete(buildConversationKey(conversation));
+    }
+    return {
+      text: followEnabled
+        ? "Thread follow is on. Future external Codex updates for this thread will be mirrored here."
+        : "Thread follow is off. External Codex updates will no longer be mirrored here.",
+    };
+  }
+
+  private async handleHistoryCommand(
+    conversation: ConversationTarget | null,
+    binding: StoredBinding | null,
+    args: string,
+  ): Promise<ReplyPayload> {
+    if (!conversation || !binding) {
+      return { text: "Bind this conversation to a Codex thread before requesting thread history." };
+    }
+    const count = parseHistoryCount(args);
+    if (typeof count === "object") {
+      return { text: count.error };
+    }
+    const entries = await this.readRecentTranscriptEntries(binding, count);
+    if (entries.length > 0) {
+      return {
+        text: this.formatTranscriptHistory(entries),
+      };
+    }
+    const replay = await this.client
+      .readThreadContext({
+        profile: this.getPermissionsMode(binding),
+        sessionKey: binding.sessionKey,
+        threadId: binding.threadId,
+      })
+      .catch(() => undefined);
+    if (!replay?.lastUserMessage && !replay?.lastAssistantMessage) {
+      return { text: "No readable transcript entries are available for this bound thread yet." };
+    }
+    const fallbackEntries: TranscriptEntry[] = [];
+    if (replay.lastUserMessage?.trim()) {
+      fallbackEntries.push({ kind: "user", text: replay.lastUserMessage.trim() });
+    }
+    if (replay.lastAssistantMessage?.trim()) {
+      fallbackEntries.push({ kind: "assistant", text: replay.lastAssistantMessage.trim() });
+    }
+    return {
+      text: this.formatTranscriptHistory(fallbackEntries),
+    };
+  }
+
   private async handleModelCommand(
     conversation: ConversationTarget | null,
     binding: StoredBinding | null,
@@ -3649,7 +3790,12 @@ export class CodexPluginController {
         if (pending) {
           await this.store.removePendingRequest(pending.requestId);
         }
-        await this.applyPendingBindingPermissionsModeMigration(params.conversation);
+        const bindingAfterCleanup = await this.applyPendingBindingPermissionsModeMigration(
+          params.conversation,
+        );
+        if (bindingAfterCleanup) {
+          await this.fastForwardTranscriptCursor(bindingAfterCleanup).catch(() => undefined);
+        }
         this.api.logger.debug?.(
           `codex turn cleaned up ${this.formatConversationForLog(params.conversation)}`,
         );
@@ -3922,7 +4068,12 @@ export class CodexPluginController {
         if (pending) {
           await this.store.removePendingRequest(pending.requestId);
         }
-        await this.applyPendingBindingPermissionsModeMigration(params.conversation);
+        const bindingAfterCleanup = await this.applyPendingBindingPermissionsModeMigration(
+          params.conversation,
+        );
+        if (bindingAfterCleanup) {
+          await this.fastForwardTranscriptCursor(bindingAfterCleanup).catch(() => undefined);
+        }
       });
   }
 
@@ -4085,7 +4236,12 @@ export class CodexPluginController {
         if (pending) {
           await this.store.removePendingRequest(pending.requestId);
         }
-        await this.applyPendingBindingPermissionsModeMigration(params.conversation);
+        const bindingAfterCleanup = await this.applyPendingBindingPermissionsModeMigration(
+          params.conversation,
+        );
+        if (bindingAfterCleanup) {
+          await this.fastForwardTranscriptCursor(bindingAfterCleanup).catch(() => undefined);
+        }
       });
   }
 
@@ -6251,6 +6407,7 @@ export class CodexPluginController {
   ): Promise<StoredBinding> {
     const sessionKey = buildPluginSessionKey(params.threadId);
     const existing = this.store.getBinding(conversation);
+    const conversationKey = buildConversationKey(conversation);
     const record: StoredBinding = {
       conversation: {
         channel: conversation.channel,
@@ -6261,6 +6418,7 @@ export class CodexPluginController {
       sessionKey,
       threadId: params.threadId,
       workspaceDir: params.workspaceDir,
+      followEnabled: existing?.followEnabled,
       permissionsMode: params.permissionsMode ?? existing?.permissionsMode ?? "default",
       pendingPermissionsMode: params.pendingPermissionsMode ?? existing?.pendingPermissionsMode,
       threadTitle:
@@ -6272,6 +6430,7 @@ export class CodexPluginController {
       updatedAt: Date.now(),
     };
     await this.store.upsertBinding(record);
+    this.transcriptMirrors.delete(conversationKey);
     return record;
   }
 
@@ -6631,6 +6790,7 @@ export class CodexPluginController {
       worktreeFolder: displayThreadState?.cwd?.trim() || binding?.workspaceDir || workspaceDir,
       contextUsage: binding?.contextUsage,
       planMode: bindingActive ? activeRun?.mode === "plan" : undefined,
+      followEnabled: bindingActive ? isFollowEnabled(binding) : undefined,
       threadNote,
       permissionNote:
         pendingProfile && activeRun
@@ -7188,11 +7348,323 @@ export class CodexPluginController {
     }
   }
 
+  private buildConversationTarget(ref: ConversationRef): ConversationTarget {
+    return {
+      channel: ref.channel,
+      accountId: ref.accountId,
+      conversationId: ref.conversationId,
+      parentConversationId: ref.parentConversationId,
+    };
+  }
+
+  private async pollTranscriptMirrors(): Promise<void> {
+    if (!this.started || this.followPollInFlight) {
+      return;
+    }
+    this.followPollInFlight = true;
+    try {
+      for (const binding of this.store.listBindings()) {
+        const conversation = this.buildConversationTarget(binding.conversation);
+        const conversationKey = buildConversationKey(conversation);
+        if (!isFollowEnabled(binding)) {
+          this.transcriptMirrors.delete(conversationKey);
+          continue;
+        }
+        if (this.activeRuns.has(conversationKey)) {
+          await this.fastForwardTranscriptCursor(binding).catch(() => undefined);
+          continue;
+        }
+        const entries = await this.readTranscriptEntriesSinceCursor(binding).catch((error) => {
+          this.api.logger.warn(
+            `codex transcript follow failed ${this.formatConversationForLog(conversation)}: ${String(error)}`,
+          );
+          return [];
+        });
+        if (entries.length === 0) {
+          continue;
+        }
+        const text = this.formatTranscriptMirrorBatch(entries);
+        if (!text) {
+          continue;
+        }
+        await this.sendText(conversation, text).catch((error) => {
+          this.api.logger.warn(
+            `codex transcript mirror send failed ${this.formatConversationForLog(conversation)}: ${String(error)}`,
+          );
+        });
+      }
+    } finally {
+      this.followPollInFlight = false;
+    }
+  }
+
+  private async fastForwardTranscriptCursor(binding: StoredBinding): Promise<void> {
+    const conversation = this.buildConversationTarget(binding.conversation);
+    const conversationKey = buildConversationKey(conversation);
+    const sessionPath = await this.findTranscriptPathForThread(binding.threadId);
+    if (!sessionPath) {
+      this.transcriptMirrors.set(conversationKey, {
+        threadId: binding.threadId,
+      });
+      return;
+    }
+    const stat = await fs.stat(sessionPath);
+    this.transcriptMirrors.set(conversationKey, {
+      threadId: binding.threadId,
+      sessionPath,
+      offset: stat.size,
+      carry: "",
+    });
+  }
+
+  private async readRecentTranscriptEntries(
+    binding: StoredBinding,
+    count: number,
+  ): Promise<TranscriptEntry[]> {
+    const sessionPath = await this.findTranscriptPathForThread(binding.threadId);
+    if (!sessionPath) {
+      return [];
+    }
+    const raw = await fs.readFile(sessionPath, "utf8");
+    const entries: TranscriptEntry[] = [];
+    for (const line of raw.split("\n")) {
+      const entry = this.parseTranscriptEntry(line);
+      if (entry) {
+        entries.push(entry);
+      }
+    }
+    return entries.slice(-count);
+  }
+
+  private async readTranscriptEntriesSinceCursor(binding: StoredBinding): Promise<TranscriptEntry[]> {
+    const conversation = this.buildConversationTarget(binding.conversation);
+    const conversationKey = buildConversationKey(conversation);
+    const currentCursor = this.transcriptMirrors.get(conversationKey);
+    const cursor =
+      currentCursor?.threadId === binding.threadId
+        ? currentCursor
+        : ({
+            threadId: binding.threadId,
+          } satisfies TranscriptMirrorCursor);
+    const resolvedSessionPath =
+      cursor.sessionPath && existsSync(cursor.sessionPath) ? cursor.sessionPath : undefined;
+    const sessionPath = resolvedSessionPath ?? (await this.findTranscriptPathForThread(binding.threadId));
+    if (!sessionPath) {
+      this.transcriptMirrors.set(conversationKey, cursor);
+      return [];
+    }
+    const stat = await fs.stat(sessionPath);
+    if (cursor.offset == null) {
+      this.transcriptMirrors.set(conversationKey, {
+        threadId: binding.threadId,
+        sessionPath,
+        offset: stat.size,
+        carry: "",
+      });
+      return [];
+    }
+    let offset = cursor.offset;
+    let carry = cursor.carry ?? "";
+    if (stat.size < offset) {
+      offset = 0;
+      carry = "";
+    }
+    if (stat.size === offset) {
+      this.transcriptMirrors.set(conversationKey, {
+        threadId: binding.threadId,
+        sessionPath,
+        offset,
+        carry,
+      });
+      return [];
+    }
+    const length = stat.size - offset;
+    const buffer = Buffer.alloc(length);
+    const handle = await fs.open(sessionPath, "r");
+    try {
+      const { bytesRead } = await handle.read(buffer, 0, length, offset);
+      const text = `${carry}${buffer.toString("utf8", 0, bytesRead)}`;
+      const lines = text.split("\n");
+      carry = lines.pop() ?? "";
+      const entries: TranscriptEntry[] = [];
+      for (const line of lines) {
+        const entry = this.parseTranscriptEntry(line);
+        if (entry) {
+          entries.push(entry);
+        }
+      }
+      this.transcriptMirrors.set(conversationKey, {
+        threadId: binding.threadId,
+        sessionPath,
+        offset: stat.size,
+        carry,
+      });
+      return entries;
+    } finally {
+      await handle.close();
+    }
+  }
+
+  private async findTranscriptPathForThread(threadId: string): Promise<string | undefined> {
+    const cachedPath = this.transcriptPathCache.get(threadId);
+    if (cachedPath && existsSync(cachedPath)) {
+      return cachedPath;
+    }
+    const sessionsRoot = path.join(os.homedir(), ".codex", "sessions");
+    if (!existsSync(sessionsRoot)) {
+      return undefined;
+    }
+    const targetSuffix = `${threadId}.jsonl`;
+    const stack = [sessionsRoot];
+    let bestPath: string | undefined;
+    let bestMtimeMs = 0;
+    while (stack.length > 0) {
+      const currentDir = stack.pop();
+      if (!currentDir) {
+        continue;
+      }
+      let entries;
+      try {
+        entries = await fs.readdir(currentDir, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const entry of entries) {
+        const fullPath = path.join(currentDir, entry.name);
+        if (entry.isDirectory()) {
+          stack.push(fullPath);
+          continue;
+        }
+        if (!entry.isFile() || !entry.name.startsWith("rollout-") || !entry.name.endsWith(targetSuffix)) {
+          continue;
+        }
+        let stat;
+        try {
+          stat = await fs.stat(fullPath);
+        } catch {
+          continue;
+        }
+        if (!bestPath || stat.mtimeMs >= bestMtimeMs) {
+          bestPath = fullPath;
+          bestMtimeMs = stat.mtimeMs;
+        }
+      }
+    }
+    if (bestPath) {
+      this.transcriptPathCache.set(threadId, bestPath);
+    }
+    return bestPath;
+  }
+
+  private parseTranscriptEntry(line: string): TranscriptEntry | undefined {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      return undefined;
+    }
+    let record: { timestamp?: string; type?: string; payload?: Record<string, unknown> };
+    try {
+      record = JSON.parse(trimmed) as { timestamp?: string; type?: string; payload?: Record<string, unknown> };
+    } catch {
+      return undefined;
+    }
+    if (record.type !== "event_msg") {
+      return undefined;
+    }
+    const payload = record.payload ?? {};
+    const payloadType = typeof payload.type === "string" ? payload.type : "";
+    const timestamp = typeof record.timestamp === "string" ? record.timestamp : undefined;
+    if (payloadType === "user_message") {
+      const text = typeof payload.message === "string" ? payload.message.trim() : "";
+      return text ? { kind: "user", text, timestamp } : undefined;
+    }
+    if (payloadType === "agent_message") {
+      const text = typeof payload.message === "string" ? payload.message.trim() : "";
+      if (!text) {
+        return undefined;
+      }
+      const phase = typeof payload.phase === "string" ? payload.phase.trim().toLowerCase() : "";
+      return {
+        kind: phase === "commentary" ? "progress" : "assistant",
+        text,
+        timestamp,
+      };
+    }
+    if (payloadType === "task_started") {
+      return { kind: "status", text: "External Codex run started.", timestamp };
+    }
+    if (payloadType === "task_complete") {
+      const lastAgentMessage =
+        typeof payload.last_agent_message === "string" ? payload.last_agent_message.trim() : "";
+      if (lastAgentMessage) {
+        return undefined;
+      }
+      return { kind: "status", text: "External Codex run completed.", timestamp };
+    }
+    return undefined;
+  }
+
+  private formatTranscriptHistory(entries: TranscriptEntry[]): string {
+    return [
+      "Recent transcript entries from the bound Codex thread:",
+      "",
+      ...entries.map((entry) => this.formatTranscriptEntry(entry)),
+    ].join("\n\n");
+  }
+
+  private formatTranscriptMirrorBatch(entries: TranscriptEntry[]): string | undefined {
+    if (entries.length === 0) {
+      return undefined;
+    }
+    const selected = entries.slice(-5);
+    const omittedCount = entries.length - selected.length;
+    return [
+      "Synced from the bound Codex thread:",
+      omittedCount > 0 ? `${omittedCount} older update(s) omitted in this batch.` : "",
+      "",
+      ...selected.map((entry) => this.formatTranscriptEntry(entry)),
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+  }
+
+  private formatTranscriptEntry(entry: TranscriptEntry): string {
+    const timeLabel = this.formatTranscriptTime(entry.timestamp);
+    const label =
+      entry.kind === "user"
+        ? "User"
+        : entry.kind === "assistant"
+          ? "Codex"
+          : entry.kind === "progress"
+            ? "Progress"
+            : "Status";
+    return [
+      timeLabel ? `${label} · ${timeLabel}` : label,
+      entry.text,
+    ].join("\n");
+  }
+
+  private formatTranscriptTime(timestamp?: string): string | undefined {
+    if (!timestamp?.trim()) {
+      return undefined;
+    }
+    const parsed = new Date(timestamp);
+    if (Number.isNaN(parsed.getTime())) {
+      return undefined;
+    }
+    return parsed.toLocaleTimeString("en-GB", {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    });
+  }
+
   private async unbindConversation(conversation: ConversationTarget): Promise<void> {
     const binding = this.store.getBinding(conversation);
     if (binding?.pinnedBindingMessage) {
       await this.unpinStoredBindingMessage(binding);
     }
+    this.transcriptMirrors.delete(buildConversationKey(conversation));
     await this.store.removeBinding(conversation);
   }
 

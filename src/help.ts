@@ -72,6 +72,31 @@ export const COMMAND_HELP: Record<CommandName, CommandHelpEntry> = {
       "/cas_steer explain why this migration is safe",
     ],
   },
+  cas_follow: {
+    summary: COMMAND_SUMMARY.cas_follow,
+    usage: "/cas_follow [on|off|status]",
+    flags: [
+      { flag: "on", description: "Mirror future external updates from the bound Codex thread into this conversation." },
+      { flag: "off", description: "Stop mirroring external thread updates into this conversation." },
+      { flag: "status", description: "Show whether thread follow is currently enabled." },
+    ],
+    examples: [
+      "/cas_follow",
+      "/cas_follow off",
+      "/cas_follow status",
+    ],
+    notes: "This only mirrors updates produced outside the plugin, so Telegram-native turns do not get echoed back a second time.",
+  },
+  cas_history: {
+    summary: COMMAND_SUMMARY.cas_history,
+    usage: "/cas_history [count]",
+    flags: [{ flag: "[count]", description: "How many recent transcript entries to show. Defaults to 8 and caps at 20." }],
+    examples: [
+      "/cas_history",
+      "/cas_history 12",
+    ],
+    notes: "History is read from the local Codex transcript for the bound thread, so it can include updates from Telegram, VS Code, Codex App, and local CLI resumes.",
+  },
   cas_plan: {
     summary: COMMAND_SUMMARY.cas_plan,
     usage: "/cas_plan <goal> | /cas_plan off",
