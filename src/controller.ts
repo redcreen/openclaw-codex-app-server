@@ -6431,6 +6431,11 @@ export class CodexPluginController {
     };
     await this.store.upsertBinding(record);
     this.transcriptMirrors.delete(conversationKey);
+    await this.refreshLocalCodexSessionIndex(record).catch((error) => {
+      this.api.logger.warn(
+        `codex session index refresh failed ${this.formatConversationForLog(conversation)} thread=${record.threadId}: ${String(error)}`,
+      );
+    });
     return record;
   }
 
@@ -7346,6 +7351,55 @@ export class CodexPluginController {
     } catch {
       return cwd;
     }
+  }
+
+  private async refreshLocalCodexSessionIndex(binding: StoredBinding): Promise<void> {
+    const codexHome = path.join(os.homedir(), ".codex");
+    const indexPath = path.join(codexHome, "session_index.jsonl");
+    const updatedAt = new Date().toISOString();
+    const threadName = binding.threadTitle?.trim();
+    let lines: string[] = [];
+    try {
+      const raw = await fs.readFile(indexPath, "utf8");
+      lines = raw.split(/\r?\n/).filter((line) => line.trim().length > 0);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw error;
+      }
+    }
+
+    let found = false;
+    const nextLines = lines.map((line) => {
+      try {
+        const record = JSON.parse(line) as { id?: string; thread_name?: string; updated_at?: string };
+        if (record.id !== binding.threadId) {
+          return line;
+        }
+        found = true;
+        const nextRecord = {
+          ...record,
+          id: binding.threadId,
+          updated_at: updatedAt,
+          ...(threadName ? { thread_name: threadName } : {}),
+        };
+        return JSON.stringify(nextRecord);
+      } catch {
+        return line;
+      }
+    });
+
+    if (!found) {
+      nextLines.push(
+        JSON.stringify({
+          id: binding.threadId,
+          ...(threadName ? { thread_name: threadName } : {}),
+          updated_at: updatedAt,
+        }),
+      );
+    }
+
+    await fs.mkdir(codexHome, { recursive: true });
+    await fs.writeFile(indexPath, `${nextLines.join("\n")}\n`, "utf8");
   }
 
   private buildConversationTarget(ref: ConversationRef): ConversationTarget {
